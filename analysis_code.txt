@@ -1,0 +1,1438 @@
+================================================================================
+analysis/01_structure_function_distance.R
+================================================================================
+
+library(tidyverse)
+library(cluster)
+library(lme4)
+library(broom.mixed)
+library(vegan)
+
+set.seed(123)
+
+structure <- read.delim("data/glycan_structure_features.tsv", check.names = FALSE)
+# Glycan, followed by curated structural feature columns
+
+modules <- read.delim("data/kegg_module_response_log2fc.tsv", check.names = FALSE)
+# Subject, Treatment, DP, Feature_ID, Feature_Type, Log2FC
+
+glycan_order <- structure$Glycan
+
+structure_dist <- structure %>%
+  column_to_rownames("Glycan") %>%
+  mutate(across(where(is.character), as.factor))
+
+struct_dist <- daisy(structure_dist, metric = "gower")
+struct_mat <- as.matrix(struct_dist)
+
+mat_to_long <- function(mat, value_name) {
+  g <- rownames(mat)
+  out <- map_dfr(seq_len(length(g) - 1), function(i) {
+    map_dfr((i + 1):length(g), function(j) {
+      tibble(glycan1 = g[i], glycan2 = g[j], value = mat[i, j])
+    })
+  })
+  names(out)[3] <- value_name
+  out
+}
+
+struct_pairs <- mat_to_long(struct_mat, "structural_distance")
+
+response_z <- modules %>%
+  transmute(
+    subject = Subject,
+    glycan = Treatment,
+    feature_id = Feature_ID,
+    response = Log2FC
+  ) %>%
+  group_by(feature_id) %>%
+  mutate(
+    response_z = (response - mean(response, na.rm = TRUE)) /
+      sd(response, na.rm = TRUE)
+  ) %>%
+  ungroup() %>%
+  filter(is.finite(response_z))
+
+expected_cells <- n_distinct(response_z$subject) * length(glycan_order)
+
+complete_features <- response_z %>%
+  distinct(feature_id, subject, glycan) %>%
+  count(feature_id) %>%
+  filter(n == expected_cells) %>%
+  pull(feature_id)
+
+functional_pairs <- response_z %>%
+  filter(feature_id %in% complete_features) %>%
+  group_by(subject) %>%
+  group_modify(~{
+    x <- .x %>%
+      select(glycan, feature_id, response_z) %>%
+      pivot_wider(names_from = feature_id, values_from = response_z) %>%
+      arrange(match(glycan, glycan_order))
+
+    mat <- as.matrix(x[, -1])
+    rownames(mat) <- x$glycan
+    mat <- mat[, colSums(is.na(mat)) == 0, drop = FALSE]
+
+    if (ncol(mat) < 20) return(tibble())
+
+    d <- as.matrix(dist(mat, method = "euclidean")) / sqrt(ncol(mat))
+    mat_to_long(d, "functional_distance")
+  }) %>%
+  ungroup()
+
+functional_median <- functional_pairs %>%
+  group_by(glycan1, glycan2) %>%
+  summarise(
+    functional_distance = median(functional_distance, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+dist_df <- functional_pairs %>%
+  left_join(struct_pairs, by = c("glycan1", "glycan2"))
+
+distance_model <- lmer(
+  functional_distance ~ structural_distance + (1 | subject),
+  data = dist_df,
+  REML = FALSE
+)
+
+distance_model_result <- broom.mixed::tidy(
+  distance_model,
+  effects = "fixed",
+  conf.int = TRUE
+) %>%
+  filter(term == "structural_distance")
+
+observed_slope <- fixef(distance_model)["structural_distance"]
+
+perm_slopes <- replicate(9999, {
+  perm <- sample(glycan_order)
+  perm_mat <- struct_mat[perm, perm]
+  dimnames(perm_mat) <- list(glycan_order, glycan_order)
+  perm_pairs <- mat_to_long(perm_mat, "structural_distance")
+
+  d <- functional_pairs %>%
+    left_join(perm_pairs, by = c("glycan1", "glycan2"))
+
+  fit <- lmer(
+    functional_distance ~ structural_distance + (1 | subject),
+    data = d,
+    REML = FALSE
+  )
+
+  fixef(fit)["structural_distance"]
+})
+
+permutation_p <- (
+  sum(perm_slopes >= observed_slope, na.rm = TRUE) + 1
+) / (
+  sum(!is.na(perm_slopes)) + 1
+)
+
+pair_to_dist <- function(dat, value_col) {
+  mat <- matrix(
+    0,
+    nrow = length(glycan_order),
+    ncol = length(glycan_order),
+    dimnames = list(glycan_order, glycan_order)
+  )
+
+  for (i in seq_len(nrow(dat))) {
+    g1 <- dat$glycan1[i]
+    g2 <- dat$glycan2[i]
+    mat[g1, g2] <- dat[[value_col]][i]
+    mat[g2, g1] <- dat[[value_col]][i]
+  }
+
+  as.dist(mat[glycan_order, glycan_order])
+}
+
+mantel_results <- dist_df %>%
+  group_by(subject) %>%
+  group_modify(~{
+    functional_dist <- pair_to_dist(.x, "functional_distance")
+    mt <- mantel(
+      struct_dist,
+      functional_dist,
+      method = "spearman",
+      permutations = 9999
+    )
+
+    tibble(
+      mantel_r = unname(mt$statistic),
+      p_value = mt$signif
+    )
+  }) %>%
+  ungroup()
+
+median_mantel_r <- median(mantel_results$mantel_r, na.rm = TRUE)
+
+
+================================================================================
+analysis/02_dp_gradient.R
+================================================================================
+
+library(dplyr)
+library(lme4)
+library(broom.mixed)
+
+modules <- read.delim("data/kegg_module_response_log2fc.tsv", check.names = FALSE)
+# Subject, Treatment, DP, Feature_ID, Feature_Type, Log2FC
+
+fit_dp <- function(d) {
+  d <- d %>%
+    filter(!is.na(Log2FC), !is.na(DP), !is.na(Subject))
+
+  if (
+    nrow(d) < 10 ||
+    n_distinct(d$DP) < 3 ||
+    n_distinct(d$Subject) < 5
+  ) return(tibble())
+
+  m0 <- lmer(
+    Log2FC ~ 1 + (1 | Subject),
+    data = d,
+    REML = FALSE
+  )
+
+  m1 <- lmer(
+    Log2FC ~ DP + (1 | Subject),
+    data = d,
+    REML = FALSE
+  )
+
+  coef_dp <- broom.mixed::tidy(
+    m1,
+    effects = "fixed"
+  ) %>%
+    filter(term == "DP")
+
+  ci <- confint(
+    m1,
+    parm = "DP",
+    method = "Wald"
+  )
+
+  tibble(
+    n = nrow(d),
+    n_subject = n_distinct(d$Subject),
+    estimate = coef_dp$estimate,
+    conf.low = ci[1, 1],
+    conf.high = ci[1, 2],
+    p_value = coef_dp$p.value,
+    delta_AIC = AIC(m0) - AIC(m1)
+  )
+}
+
+dp_results <- modules %>%
+  filter(Treatment %in% c("KES", "NYS", "KP", "KH")) %>%
+  group_by(Feature_Type, Feature_ID) %>%
+  group_modify(~fit_dp(.x)) %>%
+  ungroup() %>%
+  group_by(Feature_Type) %>%
+  mutate(q_value = p.adjust(p_value, method = "BH")) %>%
+  ungroup()
+
+dp_significant <- dp_results %>%
+  filter(
+    q_value < 0.05,
+    delta_AIC > 2,
+    n_subject == 18
+  ) %>%
+  mutate(
+    total_effect_DP3_to_DP6 = estimate * 3,
+    total_conf_low = conf.low * 3,
+    total_conf_high = conf.high * 3,
+    direction = if_else(
+      total_effect_DP3_to_DP6 > 0,
+      "positive",
+      "negative"
+    )
+  )
+
+
+================================================================================
+analysis/03_ordered_cazyme_response.R
+================================================================================
+
+library(dplyr)
+library(lme4)
+library(emmeans)
+library(splines)
+
+cazyme <- read.delim("data/cazyme_response_log2fc.tsv", check.names = FALSE)
+# Subject, Treatment, CAZyme, Log2FC
+
+analyze_cazyme <- function(item, treatment_order, spline_df) {
+  d <- cazyme %>%
+    filter(CAZyme == item, Treatment %in% treatment_order) %>%
+    transmute(
+      subject = factor(Subject),
+      treatment = factor(
+        Treatment,
+        levels = treatment_order,
+        ordered = TRUE
+      ),
+      t = as.integer(treatment),
+      response = Log2FC
+    ) %>%
+    filter(!is.na(subject), !is.na(t), !is.na(response))
+
+  fit <- lmer(
+    response ~ splines::bs(t, df = spline_df) + (1 | subject),
+    data = d,
+    REML = TRUE
+  )
+
+  emm <- emmeans(
+    fit,
+    ~ t,
+    at = list(t = seq_along(treatment_order))
+  )
+
+  null_ml <- lmer(
+    response ~ 1 + (1 | subject),
+    data = d,
+    REML = FALSE
+  )
+
+  full_ml <- update(fit, REML = FALSE)
+
+  list(
+    LRT = anova(null_ml, full_ml),
+    emmeans = summary(emm, infer = c(TRUE, TRUE)),
+    Tukey = summary(
+      pairs(emm, adjust = "tukey"),
+      infer = c(TRUE, TRUE)
+    )
+  )
+}
+
+cazyme_results <- list(
+  FOS_fructan_beta_fructosidase = analyze_cazyme(
+    "fructan beta-fructosidase.",
+    c("KES", "NYS", "KP", "KH"),
+    3
+  ),
+  FOS_beta_fructofuranosidase = analyze_cazyme(
+    "beta-fructofuranosidase.",
+    c("KES", "NYS", "KP", "KH"),
+    3
+  ),
+  GSD_alpha_galactosidase = analyze_cazyme(
+    "alpha-galactosidase.",
+    c("GAL", "RAF", "STA"),
+    2
+  ),
+  GSD_beta_galactosidase = analyze_cazyme(
+    "beta-galactosidase.",
+    c("GAL", "RAF", "STA"),
+    2
+  )
+)
+
+
+================================================================================
+analysis/04_producer_guild_resampling.py
+================================================================================
+
+import numpy as np
+import pandas as pd
+from scipy.spatial.distance import braycurtis
+from statsmodels.stats.multitest import multipletests
+
+df = pd.read_csv("data/dp_ko_producer_abundance.tsv", sep="\t")
+# Sample, Subject, Treatment, KO, Direction, Producer, Abundance
+
+FOS = ["KES", "NYS", "KP", "KH"]
+df = df[
+    df["Treatment"].isin(FOS + ["PBS"]) &
+    df["Direction"].isin(["positive", "negative"])
+].copy()
+
+def producer_shift(data, selected_kos):
+    d = data[data["KO"].isin(selected_kos)].copy()
+
+    producer = (
+        d.groupby(
+            ["Sample", "Subject", "Treatment", "Producer"],
+            as_index=False
+        )["Abundance"]
+        .sum()
+    )
+
+    producer["Fraction"] = (
+        producer["Abundance"] /
+        producer.groupby("Sample")["Abundance"].transform("sum")
+    )
+
+    rows = []
+
+    for subject in producer["Subject"].unique():
+        ds = producer[producer["Subject"] == subject]
+        pbs_samples = ds.loc[
+            ds["Treatment"] == "PBS",
+            "Sample"
+        ].unique()
+
+        if len(pbs_samples) == 0:
+            continue
+
+        pbs = (
+            ds[ds["Sample"] == pbs_samples[0]]
+            .set_index("Producer")["Fraction"]
+        )
+
+        for treatment in FOS:
+            samples = ds.loc[
+                ds["Treatment"] == treatment,
+                "Sample"
+            ].unique()
+
+            if len(samples) == 0:
+                continue
+
+            cur = (
+                ds[ds["Sample"] == samples[0]]
+                .set_index("Producer")["Fraction"]
+            )
+
+            producers = cur.index.union(pbs.index)
+            x = cur.reindex(producers, fill_value=0).to_numpy()
+            y = pbs.reindex(producers, fill_value=0).to_numpy()
+
+            rows.append({
+                "Subject": subject,
+                "Treatment": treatment,
+                "BrayCurtis": braycurtis(x, y)
+            })
+
+    return pd.DataFrame(rows)
+
+positive_kos = sorted(
+    df.loc[df["Direction"] == "positive", "KO"].unique()
+)
+
+negative_kos = sorted(
+    df.loc[df["Direction"] == "negative", "KO"].unique()
+)
+
+observed_negative = (
+    producer_shift(df, negative_kos)
+    .groupby("Treatment")["BrayCurtis"]
+    .mean()
+)
+
+observed_positive = (
+    producer_shift(df, positive_kos)
+    .groupby("Treatment")["BrayCurtis"]
+    .mean()
+)
+
+rng = np.random.default_rng(1)
+null_rows = []
+
+for iteration in range(1000):
+    sampled = rng.choice(
+        positive_kos,
+        size=len(negative_kos),
+        replace=False
+    )
+
+    means = (
+        producer_shift(df, sampled)
+        .groupby("Treatment")["BrayCurtis"]
+        .mean()
+    )
+
+    for treatment, value in means.items():
+        null_rows.append({
+            "Iteration": iteration,
+            "Treatment": treatment,
+            "MatchedPositiveMean": value
+        })
+
+null = pd.DataFrame(null_rows)
+rows = []
+
+for treatment in FOS:
+    v = null.loc[
+        null["Treatment"] == treatment,
+        "MatchedPositiveMean"
+    ].dropna().to_numpy()
+
+    obs = observed_negative[treatment]
+    center = v.mean()
+
+    p = (
+        np.sum(np.abs(v - center) >= abs(obs - center)) + 1
+    ) / (len(v) + 1)
+
+    q025, q975 = np.quantile(v, [0.025, 0.975])
+
+    rows.append({
+        "Treatment": treatment,
+        "ObservedNegative": obs,
+        "ObservedFullPositive": observed_positive[treatment],
+        "NullMean": center,
+        "NullQ025": q025,
+        "NullQ975": q975,
+        "P": p
+    })
+
+producer_resampling_results = pd.DataFrame(rows)
+producer_resampling_results["Q"] = multipletests(
+    producer_resampling_results["P"],
+    method="fdr_bh"
+)[1]
+
+
+================================================================================
+analysis/05_producer_mechanism.py
+================================================================================
+
+import numpy as np
+import pandas as pd
+from scipy.spatial.distance import jensenshannon
+
+cazyme = pd.read_csv("data/cazyme_response_log2fc.tsv", sep="\t")
+# Subject, Treatment, CAZyme, Log2FC
+
+profiles = pd.read_csv(
+    "data/beta_fructofuranosidase_producer_profiles.tsv",
+    sep="\t"
+)
+# Subject, Treatment, Species, TaxonAbundance, EnzymeContribution
+
+enzyme = (
+    cazyme[
+        (cazyme["CAZyme"] == "beta-fructofuranosidase.") &
+        cazyme["Treatment"].isin(["RAF", "STA"])
+    ]
+    .pivot(
+        index="Subject",
+        columns="Treatment",
+        values="Log2FC"
+    )
+)
+
+enzyme["DeltaFunc"] = enzyme["STA"] - enzyme["RAF"]
+
+producer_total = (
+    profiles[
+        profiles["Treatment"].isin(["RAF", "STA"])
+    ]
+    .groupby(["Subject", "Treatment"])["TaxonAbundance"]
+    .sum()
+    .unstack()
+)
+
+producer_total["DeltaTaxa"] = np.log2(
+    producer_total["STA"] / producer_total["RAF"]
+)
+
+def contribution_jsd(d, eps=1e-12):
+    x = (
+        d.pivot_table(
+            index="Species",
+            columns="Treatment",
+            values="EnzymeContribution",
+            aggfunc="sum",
+            fill_value=0
+        )
+        .reindex(columns=["RAF", "STA"], fill_value=0)
+    )
+
+    p = x["RAF"].to_numpy(dtype=float) + eps
+    q = x["STA"].to_numpy(dtype=float) + eps
+    p /= p.sum()
+    q /= q.sum()
+
+    return jensenshannon(p, q)
+
+jsd = (
+    profiles[
+        profiles["Treatment"].isin(["RAF", "STA"])
+    ]
+    .groupby("Subject")
+    .apply(contribution_jsd)
+    .rename("JSD")
+)
+
+producer_mechanism = (
+    enzyme[["DeltaFunc"]]
+    .join(producer_total[["DeltaTaxa"]])
+    .join(jsd)
+    .dropna()
+)
+
+producer_mechanism["DeltaR"] = (
+    producer_mechanism["DeltaFunc"] -
+    producer_mechanism["DeltaTaxa"]
+)
+
+def contribution_partition(d):
+    x = (
+        d.pivot_table(
+            index="Species",
+            columns="Treatment",
+            values="EnzymeContribution",
+            aggfunc="sum",
+            fill_value=0
+        )
+        .reindex(columns=["RAF", "STA"], fill_value=0)
+    )
+
+    raf = x["RAF"] > 0
+    sta = x["STA"] > 0
+    shared = raf & sta
+    raf_only = raf & ~sta
+    sta_only = sta & ~raf
+
+    raf_total = x["RAF"].sum()
+    sta_total = x["STA"].sum()
+
+    return pd.Series({
+        "RAF_shared_fraction":
+            x.loc[shared, "RAF"].sum() / raf_total,
+        "RAF_only_fraction":
+            x.loc[raf_only, "RAF"].sum() / raf_total,
+        "STA_shared_fraction":
+            x.loc[shared, "STA"].sum() / sta_total,
+        "STA_only_fraction":
+            x.loc[sta_only, "STA"].sum() / sta_total
+    })
+
+producer_partition = (
+    profiles[
+        profiles["Treatment"].isin(["RAF", "STA"])
+    ]
+    .groupby("Subject")
+    .apply(contribution_partition)
+    .reset_index()
+)
+
+
+================================================================================
+analysis/06_wgcna_modules.R
+================================================================================
+
+library(dplyr)
+library(tidyr)
+library(WGCNA)
+library(dynamicTreeCut)
+
+ko <- read.delim("data/ko_abundance_by_sample.tsv", check.names = FALSE)
+# Round, Sample, KO, Abundance; choose soft_power separately for each round based on scale-free topology fit and network connectivity.
+
+ko <- ko %>%
+  mutate(KO = sub(":.*$", "", KO))
+
+run_wgcna <- function(d, soft_power) {
+  wide <- d %>%
+    select(Sample, KO, Abundance) %>%
+    group_by(Sample, KO) %>%
+    summarise(Abundance = sum(Abundance), .groups = "drop") %>%
+    pivot_wider(
+      names_from = Sample,
+      values_from = Abundance,
+      values_fill = 0
+    )
+
+  mat <- as.matrix(wide[, -1])
+  rownames(mat) <- wide$KO
+  mat <- mat[
+    rowSums(mat == 0) <= ncol(mat) * 0.70,
+    ,
+    drop = FALSE
+  ]
+
+  data <- t(log2(mat + 1))
+
+  gsg <- goodSamplesGenes(data, verbose = 0)
+
+  if (!gsg$allOK) {
+    data <- data[
+      gsg$goodSamples,
+      gsg$goodGenes,
+      drop = FALSE
+    ]
+  }
+
+  TOM <- TOMsimilarityFromExpr(
+    data,
+    power = soft_power,
+    networkType = "signed",
+    TOMType = "signed",
+    corType = "bicor"
+  )
+
+  dissTOM <- 1 - TOM
+
+  geneTree <- hclust(
+    as.dist(dissTOM),
+    method = "average"
+  )
+
+  dynamicMods <- cutreeDynamic(
+    dendro = geneTree,
+    distM = dissTOM,
+    method = "hybrid",
+    deepSplit = 3,
+    pamStage = TRUE,
+    pamRespectsDendro = FALSE,
+    minClusterSize = 30
+  )
+
+  dynamicColors <- labels2colors(dynamicMods)
+
+  merge <- mergeCloseModules(
+    data,
+    dynamicColors,
+    cutHeight = 0.25,
+    corFnc = "bicor",
+    corOptions = list(
+      use = "p",
+      maxPOutliers = 0.05
+    ),
+    verbose = 0
+  )
+
+  moduleColors <- merge$colors
+  names(moduleColors) <- colnames(data)
+
+  MEs <- orderMEs(
+    merge$newMEs
+  )
+
+  kME <- signedKME(
+    datExpr = data,
+    datME = MEs,
+    corFnc = "bicor",
+    corOptions = "use = 'p', maxPOutliers = 0.05"
+  )
+
+  target <- intersect(
+    c("K01193", "K03332", "K07406", "K07407"),
+    rownames(kME)
+  )
+
+  target_summary <- data.frame()
+
+  if (length(target) > 0) {
+    k <- kME[target, , drop = FALSE]
+
+    top_col <- apply(
+      k,
+      1,
+      function(x) names(x)[which.max(x)]
+    )
+
+    top_val <- apply(
+      k,
+      1,
+      max,
+      na.rm = TRUE
+    )
+
+    target_summary <- data.frame(
+      KO = target,
+      assigned_module = moduleColors[target],
+      highest_kME_module = sub("^kME", "", top_col),
+      highest_kME = top_val,
+      row.names = NULL
+    )
+  }
+
+  list(
+    module_colors = moduleColors,
+    module_eigengenes = MEs,
+    kME = kME,
+    target_modules = target_summary
+  )
+}
+
+
+================================================================================
+analysis/07_metabolite_age_treatment.R
+================================================================================
+
+library(dplyr)
+library(lme4)
+library(emmeans)
+
+met <- read.delim("data/metabolite_net_concentration.tsv", check.names = FALSE)
+# Assay, Analyte, Subject, Round, Treatment, Age, Concentration
+
+met <- met %>%
+  mutate(
+    Concentration = as.numeric(Concentration),
+    y = asinh(Concentration)
+  ) %>%
+  group_by(
+    Assay,
+    Analyte,
+    Subject,
+    Round,
+    Treatment,
+    Age
+  ) %>%
+  summarise(
+    y = mean(y, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  filter(!(Assay == "AA" & Analyte == "Serotonin"))
+
+fit_one <- function(d, adjusted_age_test) {
+  age_mean <- d %>%
+    distinct(Subject, Age) %>%
+    summarise(x = mean(Age, na.rm = TRUE)) %>%
+    pull(x)
+
+  d <- d %>%
+    mutate(
+      Age_c = Age - age_mean,
+      Treatment = relevel(factor(Treatment), ref = "PBS")
+    )
+
+  full <- lmer(
+    y ~ Treatment * Age_c + (1 | Subject),
+    data = d,
+    REML = FALSE
+  )
+
+  add <- lmer(
+    y ~ Treatment + Age_c + (1 | Subject),
+    data = d,
+    REML = FALSE
+  )
+
+  age_only <- lmer(
+    y ~ Age_c + (1 | Subject),
+    data = d,
+    REML = FALSE
+  )
+
+  trt_only <- lmer(
+    y ~ Treatment + (1 | Subject),
+    data = d,
+    REML = FALSE
+  )
+
+  null <- lmer(
+    y ~ 1 + (1 | Subject),
+    data = d,
+    REML = FALSE
+  )
+
+  p_age <- if (adjusted_age_test) {
+    anova(trt_only, add)$`Pr(>Chisq)`[2]
+  } else {
+    anova(null, age_only)$`Pr(>Chisq)`[2]
+  }
+
+  list(
+    stats = data.frame(
+      p_Age = p_age,
+      p_Treatment = anova(age_only, add)$`Pr(>Chisq)`[2],
+      p_Interaction = anova(add, full)$`Pr(>Chisq)`[2]
+    ),
+    full = full,
+    add = add,
+    age_mean = age_mean,
+    data = d
+  )
+}
+
+keys <- met %>%
+  distinct(Assay, Round, Analyte)
+
+fits <- list()
+stats <- list()
+
+for (i in seq_len(nrow(keys))) {
+  k <- keys[i, ]
+  d <- met %>%
+    filter(
+      Assay == k$Assay,
+      Round == k$Round,
+      Analyte == k$Analyte
+    )
+
+  if (!("PBS" %in% d$Treatment)) next
+
+  fit <- fit_one(
+    d,
+    adjusted_age_test = k$Assay == "SCFA"
+  )
+
+  id <- paste(k$Assay, k$Round, k$Analyte, sep = "||")
+  fits[[id]] <- fit
+
+  stats[[id]] <- cbind(
+    k,
+    fit$stats
+  )
+}
+
+metabolite_omnibus <- bind_rows(stats) %>%
+  group_by(Assay, Round) %>%
+  mutate(
+    q_Age = p.adjust(p_Age, method = "BH"),
+    q_Treatment = p.adjust(p_Treatment, method = "BH"),
+    q_Interaction = p.adjust(p_Interaction, method = "BH")
+  ) %>%
+  ungroup()
+
+selected <- metabolite_omnibus %>%
+  filter(
+    q_Treatment < 0.05,
+    is.na(q_Interaction) | q_Interaction >= 0.05
+  )
+
+posthoc <- list()
+
+for (i in seq_len(nrow(selected))) {
+  k <- selected[i, ]
+  id <- paste(k$Assay, k$Round, k$Analyte, sep = "||")
+  fit <- fits[[id]]$add
+
+  z <- contrast(
+    emmeans(fit, ~ Treatment),
+    method = "trt.vs.ctrl",
+    ref = "PBS",
+    adjust = "none"
+  ) %>%
+    as.data.frame() %>%
+    mutate(
+      Assay = k$Assay,
+      Round = k$Round,
+      Analyte = k$Analyte
+    )
+
+  posthoc[[id]] <- z
+}
+
+metabolite_posthoc <- bind_rows(posthoc)
+
+aa_posthoc <- metabolite_posthoc %>%
+  filter(Assay == "AA") %>%
+  group_by(Assay, Round, Analyte) %>%
+  mutate(q.value = p.adjust(p.value, method = "BH")) %>%
+  ungroup()
+
+scfa_posthoc <- metabolite_posthoc %>%
+  filter(Assay == "SCFA") %>%
+  group_by(Assay, Round, contrast) %>%
+  mutate(q.value = p.adjust(p.value, method = "BH")) %>%
+  ungroup()
+
+valerate_age_effects <- list()
+
+val_keys <- metabolite_omnibus %>%
+  filter(
+    Assay == "SCFA",
+    Analyte == "C5-Valerate"
+  )
+
+for (i in seq_len(nrow(val_keys))) {
+  k <- val_keys[i, ]
+  id <- paste(k$Assay, k$Round, k$Analyte, sep = "||")
+  fit <- fits[[id]]
+
+  ages <- seq(
+    min(fit$data$Age, na.rm = TRUE),
+    max(fit$data$Age, na.rm = TRUE),
+    length.out = 100
+  )
+
+  emm <- emmeans(
+    fit$full,
+    ~ Treatment | Age_c,
+    at = list(
+      Age_c = ages - fit$age_mean
+    )
+  )
+
+  z <- contrast(
+    emm,
+    method = "trt.vs.ctrl",
+    ref = "PBS",
+    adjust = "none"
+  ) %>%
+    as.data.frame() %>%
+    mutate(
+      Round = k$Round,
+      Age = Age_c + fit$age_mean
+    )
+
+  valerate_age_effects[[as.character(k$Round)]] <- z
+}
+
+valerate_age_effects <- bind_rows(valerate_age_effects)
+
+
+================================================================================
+analysis/08_mucin_score.R
+================================================================================
+
+library(dplyr)
+library(lme4)
+library(lmerTest)
+library(emmeans)
+library(multcomp)
+
+mucin <- read.delim("data/mucin_marker_response_log2fc.tsv", check.names = FALSE)
+# Subject, Treatment, Marker, Log2FC
+
+score <- mucin %>%
+  group_by(Subject, Treatment) %>%
+  summarise(
+    MucinScore = median(Log2FC, na.rm = TRUE),
+    N_detected = sum(!is.na(Log2FC)),
+    .groups = "drop"
+  ) %>%
+  filter(N_detected >= 4) %>%
+  mutate(
+    Subject = factor(Subject),
+    Treatment = factor(
+      Treatment,
+      levels = c("KES", "NYS", "KP", "KH", "GAL", "RAF", "STA")
+    )
+  )
+
+fit <- lmer(
+  MucinScore ~ Treatment + (1 | Subject),
+  data = score
+)
+
+mucin_omnibus <- anova(fit)
+
+emm <- emmeans(fit, ~ Treatment)
+
+mucin_pairwise <- pairs(
+  emm,
+  adjust = "tukey"
+) %>%
+  summary(infer = TRUE) %>%
+  as.data.frame()
+
+mucin_cld <- cld(
+  emm,
+  adjust = "tukey",
+  alpha = 0.05,
+  Letters = letters
+) %>%
+  as.data.frame() %>%
+  mutate(
+    group = gsub("\\s+", "", .group)
+  ) %>%
+  select(
+    Treatment,
+    emmean,
+    SE,
+    df,
+    lower.CL,
+    upper.CL,
+    group
+  )
+
+
+================================================================================
+analysis/09_pbs_age_taxa.py
+================================================================================
+
+import numpy as np
+import pandas as pd
+from scipy.stats import chi2, norm
+from statsmodels.formula.api import mixedlm
+from statsmodels.stats.multitest import multipletests
+
+data = pd.read_csv("data/pbs_species_abundance.tsv", sep="\t")
+# Taxon, Subject, AgeGroup, PBS_Rep, Sex, Abundance
+
+AGE_TERM = 'C(AgeGroup, Treatment(reference="Young"))'
+ALPHA = 0.05
+
+def fit_taxon(d, pseudo=None):
+    d = d.copy()
+
+    if pseudo is None:
+        positive = d.loc[d["Abundance"] > 0, "Abundance"]
+        pseudo = positive.min() / 2
+
+    d["y"] = np.log2(d["Abundance"] + pseudo)
+
+    formula = f"y ~ {AGE_TERM} + C(PBS_Rep)"
+    if d["Sex"].nunique(dropna=True) > 1:
+        formula += " + C(Sex)"
+
+    fit = None
+
+    for method in ("lbfgs", "powell"):
+        try:
+            fit = mixedlm(
+                formula,
+                data=d,
+                groups=d["Subject"],
+                re_formula="1"
+            ).fit(
+                reml=False,
+                method=method,
+                disp=False
+            )
+            break
+        except Exception:
+            pass
+
+    if fit is None:
+        raise RuntimeError("MixedLM failed")
+
+    params = fit.params
+    cov = fit.cov_params()
+
+    mid = f"{AGE_TERM}[T.Middle]"
+    old = f"{AGE_TERM}[T.Old]"
+
+    b = params[[mid, old]].values
+    V = cov.loc[[mid, old], [mid, old]].values
+    p_overall = chi2.sf(b @ np.linalg.pinv(V) @ b, 2)
+
+    contrasts = {
+        "Middle vs Young": {mid: 1},
+        "Old vs Young": {old: 1},
+        "Old vs Middle": {old: 1, mid: -1},
+    }
+
+    rows = []
+
+    for name, weights in contrasts.items():
+        c = np.zeros(len(params))
+
+        for term, weight in weights.items():
+            c[params.index.get_loc(term)] = weight
+
+        estimate = c @ params.values
+        se = np.sqrt(c @ cov.values @ c)
+        p = 2 * norm.sf(abs(estimate / se))
+
+        rows.append({
+            "Contrast": name,
+            "log2FC": estimate,
+            "SE": se,
+            "CI_low": estimate - 1.96 * se,
+            "CI_high": estimate + 1.96 * se,
+            "P": p
+        })
+
+    return p_overall, pd.DataFrame(rows), pseudo
+
+main_rows = []
+pair_rows = []
+pseudocounts = {}
+
+for taxon, d in data.groupby("Taxon"):
+    p, pair, pseudo = fit_taxon(d)
+    pseudocounts[taxon] = pseudo
+    main_rows.append({"Taxon": taxon, "P": p})
+    pair["Taxon"] = taxon
+    pair_rows.append(pair)
+
+pbs_age_overall = pd.DataFrame(main_rows)
+pbs_age_pairwise = pd.concat(pair_rows, ignore_index=True)
+
+pbs_age_overall["FDR"] = multipletests(
+    pbs_age_overall["P"],
+    method="fdr_bh"
+)[1]
+
+pbs_age_pairwise["FDR"] = (
+    pbs_age_pairwise
+    .groupby("Contrast")["P"]
+    .transform(
+        lambda x: multipletests(
+            x,
+            method="fdr_bh"
+        )[1]
+    )
+)
+
+targets = pbs_age_pairwise[
+    pbs_age_pairwise["FDR"] <= ALPHA
+].copy()
+
+loso_rows = []
+
+for _, target in targets.iterrows():
+    taxon = target["Taxon"]
+    contrast = target["Contrast"]
+    original_sign = np.sign(target["log2FC"])
+    d = data[data["Taxon"] == taxon].copy()
+    pseudo = pseudocounts[taxon]
+
+    for subject in d["Subject"].unique():
+        d_loo = d[d["Subject"] != subject].copy()
+
+        try:
+            _, res, _ = fit_taxon(
+                d_loo,
+                pseudo=pseudo
+            )
+
+            r = res[
+                res["Contrast"] == contrast
+            ].iloc[0]
+
+            loso_rows.append({
+                "Taxon": taxon,
+                "Contrast": contrast,
+                "LeftOutSubject": subject,
+                "P": r["P"],
+                "SameDirection":
+                    np.sign(r["log2FC"]) == original_sign
+            })
+        except Exception:
+            pass
+
+loso = pd.DataFrame(loso_rows)
+
+loso_summary = (
+    loso
+    .groupby(["Taxon", "Contrast"])
+    .agg(
+        n_runs=("P", "size"),
+        all_significant=(
+            "P",
+            lambda x: (x <= ALPHA).all()
+        ),
+        all_same_direction=(
+            "SameDirection",
+            "all"
+        )
+    )
+    .reset_index()
+)
+
+loso_summary["LOSO_robust"] = (
+    (loso_summary["n_runs"] >= 3) &
+    loso_summary["all_significant"] &
+    loso_summary["all_same_direction"]
+)
+
+
+================================================================================
+analysis/10_age_treatment_abundance.R
+================================================================================
+
+library(dplyr)
+library(lme4)
+library(lmerTest)
+library(emmeans)
+
+abundance <- read.delim("data/age_treatment_abundance.tsv", check.names = FALSE)
+# Feature, Round, Subject, AgeGroup, Treatment, Abundance
+
+abundance_mean <- abundance %>%
+  group_by(
+    Feature,
+    Round,
+    Subject,
+    AgeGroup,
+    Treatment
+  ) %>%
+  summarise(
+    Abundance = mean(Abundance, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+pbs_age <- abundance_mean %>%
+  filter(Treatment == "PBS") %>%
+  group_by(Feature, Round) %>%
+  group_modify(~{
+    d <- .x
+    pseudo <- min(
+      d$Abundance[d$Abundance > 0],
+      na.rm = TRUE
+    ) / 2
+
+    d <- d %>%
+      mutate(
+        y = log2(Abundance + pseudo),
+        AgeGroup = factor(
+          AgeGroup,
+          levels = c("Young", "Middle", "Old")
+        )
+      )
+
+    fit <- lm(y ~ AgeGroup, data = d)
+
+    pairs(
+      emmeans(fit, ~ AgeGroup),
+      adjust = "tukey"
+    ) %>%
+      as.data.frame()
+  })
+
+treatment_vs_pbs <- abundance_mean %>%
+  group_by(Feature, Round, AgeGroup) %>%
+  group_modify(~{
+    d <- .x
+
+    if (!("PBS" %in% d$Treatment)) return(tibble())
+
+    pseudo <- min(
+      d$Abundance[d$Abundance > 0],
+      na.rm = TRUE
+    ) / 2
+
+    d <- d %>%
+      mutate(
+        y = log2(Abundance + pseudo),
+        Treatment = relevel(
+          factor(Treatment),
+          ref = "PBS"
+        )
+      )
+
+    fit <- lmer(
+      y ~ Treatment + (1 | Subject),
+      data = d
+    )
+
+    contrast(
+      emmeans(fit, ~ Treatment),
+      method = "trt.vs.ctrl",
+      ref = "PBS",
+      adjust = "dunnett"
+    ) %>%
+      as.data.frame()
+  })
+
+m00567_detection <- abundance_mean %>%
+  filter(
+    Feature == "M00567",
+    Treatment == "PBS"
+  ) %>%
+  group_by(
+    Round,
+    AgeGroup
+  ) %>%
+  summarise(
+    detected = sum(Abundance > 0),
+    total = n(),
+    fraction = detected / total,
+    .groups = "drop"
+  )
+
+
+================================================================================
+analysis/11_ko_butyrate_interaction.R
+================================================================================
+
+library(dplyr)
+library(lme4)
+library(lmerTest)
+library(emmeans)
+library(purrr)
+
+dat <- read.delim("data/ko_butyrate_subject_data.tsv", check.names = FALSE)
+# Subject, Round, Treatment, AgeGroup, KO, KOAbundance, Butyrate
+
+dat <- dat %>%
+  filter(KO %in% c("K00634", "K00929")) %>%
+  mutate(
+    AgeGroup = factor(
+      AgeGroup,
+      levels = c("Young", "Middle", "Old")
+    ),
+    KO_log2 = log2(KOAbundance + 1),
+    Butyrate_log2 = log2(Butyrate + 1)
+  )
+
+treatments <- list(
+  FOS = c("KES", "NYS", "KP", "KH"),
+  GSD = c("GAL", "RAF", "STA")
+)
+
+fit_pair <- function(d, treatment_order) {
+  d <- d %>%
+    filter(Treatment %in% treatment_order) %>%
+    mutate(
+      Treatment = factor(
+        Treatment,
+        levels = treatment_order
+      )
+    )
+
+  fit <- lmer(
+    Butyrate_log2 ~
+      KO_log2 * AgeGroup * Treatment +
+      (1 | Subject),
+    data = d
+  )
+
+  slopes <- emtrends(
+    fit,
+    ~ AgeGroup | Treatment,
+    var = "KO_log2"
+  ) %>%
+    test() %>%
+    as.data.frame() %>%
+    mutate(
+      q.value = p.adjust(
+        p.value,
+        method = "BH"
+      )
+    )
+
+  x_grid <- seq(
+    min(d$KO_log2, na.rm = TRUE),
+    max(d$KO_log2, na.rm = TRUE),
+    length.out = 60
+  )
+
+  predictions <- emmip(
+    fit,
+    AgeGroup ~ KO_log2 | Treatment,
+    at = list(KO_log2 = x_grid),
+    CIs = TRUE,
+    plotit = FALSE
+  )
+
+  list(
+    fit = fit,
+    slopes = slopes,
+    predictions = predictions
+  )
+}
+
+ko_butyrate_results <- list()
+
+for (ko in c("K00634", "K00929")) {
+  for (round in names(treatments)) {
+    id <- paste(ko, round, sep = "_")
+
+    ko_butyrate_results[[id]] <- fit_pair(
+      dat %>%
+        filter(
+          KO == ko,
+          Round == round
+        ),
+      treatments[[round]]
+    )
+  }
+}
+
+ko_butyrate_slopes <- imap_dfr(
+  ko_butyrate_results,
+  function(x, id) {
+    parts <- strsplit(id, "_")[[1]]
+
+    x$slopes %>%
+      mutate(
+        KO = parts[1],
+        Round = parts[2]
+      )
+  }
+)
