@@ -3,27 +3,43 @@ analysis/01_structure_function_distance.R
 ================================================================================
 
 library(tidyverse)
-library(cluster)
 library(lme4)
 library(broom.mixed)
 library(vegan)
 
 set.seed(123)
 
-structure <- read.delim("data/glycan_structure_features.tsv", check.names = FALSE)
-# Glycan, followed by curated structural feature columns
+# Glycan order
+glycan_order <- c("KES", "NYS", "KP", "KH", "RAF", "STA", "GAL")
 
-modules <- read.delim("data/kegg_module_response_log2fc.tsv", check.names = FALSE)
-# Subject, Treatment, DP, Feature_ID, Feature_Type, Log2FC
+# Functional response data
+modules <- read.delim(
+  "data/kegg_module_response_log2fc.tsv",
+  check.names = FALSE
+)
 
-glycan_order <- structure$Glycan
+# Exact glycosidic linkage matching + Dice dissimilarity
+dice <- read.csv(
+  "data/glycan_Dice_dissimilarity_matrix.csv",
+  row.names = 1,
+  check.names = FALSE
+)
 
-structure_dist <- structure %>%
-  column_to_rownames("Glycan") %>%
-  mutate(across(where(is.character), as.factor))
+stopifnot(
+  setequal(rownames(dice), glycan_order),
+  setequal(colnames(dice), glycan_order)
+)
 
-struct_dist <- daisy(structure_dist, metric = "gower")
-struct_mat <- as.matrix(struct_dist)
+struct_mat <- as.matrix(dice[glycan_order, glycan_order])
+
+stopifnot(
+  isTRUE(all.equal(struct_mat, t(struct_mat))),
+  all(diag(struct_mat) == 0),
+  all(is.finite(struct_mat)),
+  all(struct_mat >= 0 & struct_mat <= 1)
+)
+
+struct_dist <- as.dist(struct_mat)
 
 mat_to_long <- function(mat, value_name) {
   g <- rownames(mat)
@@ -106,29 +122,77 @@ distance_model_result <- broom.mixed::tidy(
 
 observed_slope <- fixef(distance_model)["structural_distance"]
 
-perm_slopes <- replicate(9999, {
-  perm <- sample(glycan_order)
-  perm_mat <- struct_mat[perm, perm]
-  dimnames(perm_mat) <- list(glycan_order, glycan_order)
-  perm_pairs <- mat_to_long(perm_mat, "structural_distance")
+# Exact permutation: all 7! = 5040 glycan-label permutations
 
-  d <- functional_pairs %>%
-    left_join(perm_pairs, by = c("glycan1", "glycan2"))
+n_subjects <- n_distinct(functional_pairs$subject)
 
-  fit <- lmer(
-    functional_distance ~ structural_distance + (1 | subject),
-    data = d,
-    REML = FALSE
-  )
+pair_id <- paste(
+  functional_pairs$glycan1,
+  functional_pairs$glycan2,
+  sep = "__"
+)
 
-  fixef(fit)["structural_distance"]
+stopifnot(
+  nrow(functional_pairs) == choose(length(glycan_order), 2) * n_subjects,
+  all(table(pair_id) == n_subjects)
+)
+
+# Mean functional distance for each glycan pair
+pair_means <- functional_pairs %>%
+  group_by(glycan1, glycan2) %>%
+  summarise(y = mean(functional_distance), .groups = "drop")
+
+pair_key <- function(a, b) {
+  paste(pmin(a, b), pmax(a, b), sep = "__")
+}
+
+idx <- match(
+  pair_key(struct_pairs$glycan1, struct_pairs$glycan2),
+  pair_key(pair_means$glycan1, pair_means$glycan2)
+)
+
+stopifnot(!anyNA(idx))
+y <- pair_means$y[idx]
+
+# Fast slope calculation, equivalent to the LMM slope
+# for this balanced repeated-measures design
+slope_from_pairs <- function(x) {
+  sum((x - mean(x)) * (y - mean(y))) /
+    sum((x - mean(x))^2)
+}
+
+stopifnot(
+  abs(slope_from_pairs(struct_pairs$structural_distance) -
+        observed_slope) < 1e-8
+)
+
+# Generate all 5040 permutations
+all_perms <- function(v) {
+  if (length(v) == 1L) return(matrix(v, nrow = 1L))
+
+  do.call(rbind, lapply(seq_along(v), function(i) {
+    cbind(v[i], all_perms(v[-i]))
+  }))
+}
+
+labels <- all_perms(seq_along(glycan_order))
+
+i <- match(struct_pairs$glycan1, glycan_order)
+j <- match(struct_pairs$glycan2, glycan_order)
+
+perm_slopes <- apply(labels, 1, function(perm) {
+  perm_mat <- struct_mat[perm, perm, drop = FALSE]
+  perm_x <- perm_mat[cbind(i, j)]
+  slope_from_pairs(perm_x)
 })
 
-permutation_p <- (
-  sum(perm_slopes >= observed_slope, na.rm = TRUE) + 1
-) / (
-  sum(!is.na(perm_slopes)) + 1
+# Exact two-sided permutation p-value
+permutation_p <- mean(
+  abs(perm_slopes) >= abs(observed_slope) - 1e-10
 )
+
+cat("LMM slope:", observed_slope, "\n")
+cat("Exact permutation p:", permutation_p, "\n")
 
 pair_to_dist <- function(dat, value_col) {
   mat <- matrix(
